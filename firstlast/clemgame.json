@@ -1,0 +1,9 @@
+{
+  "game_name": "firstlast",
+  "description": "FirstLast game between two players that must match the first letters of the first and last word of their responses.",
+  "main_game": "firstlast",
+  "players": "two",
+  "image": "none",
+  "languages": ["en"],
+  "benchmark": []
+}
