@@ -1,24 +1,28 @@
-import copy
-from copy import deepcopy
-from typing import List, Dict, Tuple
+import os.path
+from typing import Dict, Tuple, List, Union
 from string import ascii_lowercase as letters
+import logging
 
 import numpy as np
 
-import clemcore.clemgame.metrics as ms
-from clemcore.clemgame import GameMaster, DialogueGameMaster, GameBenchmark, GameSpec, GameScorer
+import clemcore.metrics as ms
+from clemcore.clemgame import GameSpec, GameMaster, GameBenchmark, Player, DialogueGameMaster, GameScorer, GameRecorder, \
+    GameException, ParseError, ValidationError
 from clemcore.backends import Model
-from clemcore.clemgame import Player
+from clemcore.utils import file_utils, string_utils
 
+# import the Speaker player class:
 from player import Speaker
+
+# initialize logging:
+logger = logging.getLogger(__name__)
 
 
 class FirstLast(DialogueGameMaster):
     """Implement mechanisms for playing FirstLast."""
+
     def __init__(self, game_name: str, game_path: str, experiment: Dict, player_models: List[Model]):
         super().__init__(game_name, game_path, experiment, player_models)
-        # assign experiment attributes that will be necessary later
-        self.topic = experiment['name']
 
     def _on_setup(self, **game_instance) -> None:
         """
@@ -26,22 +30,27 @@ class FirstLast(DialogueGameMaster):
         Args:
             game_instance: The game instance dict.
         """
-        self.game_instance = game_instance
+        self.game_instance: dict = game_instance
 
-        self.n_turns = game_instance['n_turns']
+        self.n_turns: int = game_instance['n_turns']
 
         # instantiate both players:
         self.player_a = Speaker(self.player_models[0], 'A', game_instance['first_letter'])
         self.player_b = Speaker(self.player_models[1], 'B', game_instance['first_letter'])
 
         # add players, including assigning their initial prompts:
-        # self.add_player(self.player_a, initial_prompt=game_instance['prompt_player_a'])
         self.add_player(self.player_a, initial_context=game_instance['prompt_player_a'])
         self.add_player(self.player_b, initial_prompt=game_instance['prompt_player_b'])
 
         # initialise game variables:
         self.current_turn: int = 0
         self.current_letter: str = game_instance['first_letter']
+        # log any additional keys that will be relevant for evaluation
+        self.log_key('n_turns', game_instance['n_turns'])
+
+        self.correct_response = False
+        self.turn_scores = [0] * (self.n_turns + 1)
+        self.complete_turns: int = 0
 
         # initialise common metrics:
         self.request_count: int = 0
@@ -51,75 +60,98 @@ class FirstLast(DialogueGameMaster):
         # initialise attributes that will be used for the evaluation scores
         self.aborted: bool = False
         self.lose: bool = False
-        self.complete_turns: int = 0
 
-        self.correct_response = False
-        self.turn_scores = [0] * (self.n_turns + 1)
-
-        # log any additional keys that will be relevant for evaluation
-        self.log_key('n_turns', game_instance['n_turns'])
-
-    def _validate_player_response(self, player: Player, response: str) -> bool:
+    def _parse_response(self, player: Player, response: str) -> Tuple[str, str]:
         """
-        Check if the response follows the move format rule.
+        Add the response to the other player's message history and check if the response follows the move format rule,
+        then split the response and return the first and last word.
         Args:
             player: The player that produced the response.
             response: The response string.
         Returns:
-            True if the move format rule was followed, else False.
+            Tuple of the first and last word of the response.
+        Raises:
+            ParseError: If the response is missing 'I SAY: '.
         """
         # increase the number of API requests:
         self.request_count += 1
-        # check move format rule:
-        if not response.startswith('I SAY:'):
-            self.aborted = True
-            # log the abortion event
-            action = {'type': 'invalid format', 'content': 'abort'}
-            self.log_event(from_='GM', to='GM', action=action)
-            # increase the counter of requests that violate form rules
-            self.violated_request_count += 1
-            return False
-        else:
-            # increase the counter of requests that conform to form rules
-            self.parsed_request_count += 1
-            # log the event that the string was valid (no strange characters)
-            action = {'type': 'metadata', 'content': 'valid string'}
-            self.log_event(from_='GM', to='GM', action=action)
-        return True
 
-    def _parse_response(self, player: Player, response: str) -> Tuple[str, str]:
-        """
-        Add the response to the other player's message history and split the response and return the first and last word.
-        """
         if player == self.player_a:
             self.set_context_for(self.player_b, response)
         if player == self.player_b:
             self.set_context_for(self.player_a, response)
+
+        # check for move format tag:
+        if not response.startswith("I SAY: "):
+            raise ParseError()
+
+        # increase the counter of requests that conform to form rules
+        self.parsed_request_count += 1
+        # log the event that the string was valid (no strange characters)
+        action = {'type': 'metadata', 'content': 'move format followed'}
+        self.log_event(from_='GM', to='GM', action=action)
+
         # remove the move format tag and split on whitespace:
         words = response[7:].split()
         return words[0].lower(), words[-1].lower()
 
+    def _on_parse_error(self, error: GameException):
+        """Abort the game due to failed parsing."""
+        # set the game to be aborted:
+        self.aborted = True
+        # increase the counter of requests that violate the move format rule:
+        self.violated_request_count += 1
+        # log the abortion event:
+        action = {'type': 'missing tag', 'content': 'abort'}
+        self.log_event(from_='GM', to='GM', action=action)
+
+    def _validate_player_response(self, player: Player, parsed_response: str):
+        """
+        Check if the parsed response follows the game rules.
+        Args:
+            player: The player that produced the response.
+            response: The response string.
+        Returns:
+            True if the game rules were followed, else False.
+        """
+        first_word_correct_letter = parsed_response[0][
+                                        0] == self.current_letter  # True if the first letter of the first word in the response is correct
+        last_word_correct_letter = parsed_response[0][0] == parsed_response[1][
+            0]  # True if the first letters of the first and last word match
+        self.correct_response = first_word_correct_letter and last_word_correct_letter
+        if not self.correct_response:
+            # log the fact that the game is now lost:
+            action = {'type': 'rule violation',
+                      'content': f'{parsed_response[0]}/{parsed_response[1]} violates rules'}
+            # Note: logged here and not in _on_validation_error() to record the actual words that violated the rules
+            self.log_event(from_='GM', to='GM', action=action)
+            raise ValidationError()
+        else:
+            # log the fact that the answer was correct:
+            action = {'type': 'valid response',
+                      'content': f'{parsed_response[0]}/{parsed_response[1]} conforms to rules'}
+            self.log_event(from_='GM', to='GM', action=action)
+            # set the current turn's score to 1:
+            self.turn_scores[self.current_turn] = 1
+
+    def _on_validation_error(self, error: GameException):
+        """Lose the game due to violated rules."""
+        self.lose = True
+
     def _on_valid_player_response(self, player: Player, parsed_response: Tuple[str, str]):
         """
-        Check player response for game rule adherence.
+        Advance the game state, preparing the next player's turn.
         Args:
             player: The current player.
             parsed_response: The parsed response, a tuple of the first and last word of the response.
         """
-        first_word_correct_letter = parsed_response[0][0] == self.current_letter  # True if the first letter of the first word in the response is correct
-        last_word_correct_letter = parsed_response[0][0] == parsed_response[1][0]  # True if the first letters of the first and last word match
-        self.correct_response = first_word_correct_letter and last_word_correct_letter
-        if not self.correct_response:
-            self.lose = True
-            # log the fact that the game is now lost
-            action = {'type': 'parse',
-                      'content': f'{parsed_response[0]}/{parsed_response[1]} violates rules'}
-            self.log_event(from_='GM', to='GM', action=action)
-        else:
-            # log the fact that the answer was correct
-            action = {'type': 'parse',
-                      'content': f'{parsed_response[0]}/{parsed_response[1]} conforms to rules'}
-            self.log_event(from_='GM', to='GM', action=action)
+        # increment current turn:
+        self.current_turn += 1
+        # increment completed turns:
+        self.complete_turns += 1
+        # update the letter being played:
+        current_index = letters.index(self.current_letter)
+        self.current_letter = letters[current_index + 1]
 
     def compute_response_score(self, response: str, context: Dict):
         """
@@ -130,28 +162,7 @@ class FirstLast(DialogueGameMaster):
         Returns:
             1 if the firstlast game rules were followed, 0 otherwise.
         """
-        response_correct: bool = False
-        # move format rule:
-        if response.startswith('I SAY:'):
-            # remove the move format tag and split on whitespace:
-            words: list = response[7:].split()
-            # check for first letter rule:
-            first_word_correct_letter = words[0][0] == self.current_letter
-            last_word_correct_letter = words[0][0] == words[-1][0]
-            response_correct = first_word_correct_letter and last_word_correct_letter
-
-        self.turn_scores[self.current_turn] += 1
-
-        return 1 if response_correct else 0
-
-    def compute_episode_score(self):
-        """
-        Calculate a score for the episode.
-        When this is reached and the last turn had a correct response, the episode gets full score.
-        """
-        if self.correct_response:
-            return 100
-        return 0
+        return self.turn_scores[self.current_turn - 1]
 
     def _does_game_proceed(self) -> bool:
         """Check if game should proceed."""
@@ -159,20 +170,15 @@ class FirstLast(DialogueGameMaster):
                 and not self.aborted
                 and not self.lose)
 
-    def _start_next_round(self) -> bool:
-        """Start next round after each player's turn.
-        Returns:
-            True
+    def compute_episode_score(self):
         """
-        return True
-
-    def _on_after_round(self):
-        """Updates the letter being played after a successful round."""
-        # update the letter being played:
-        current_index = letters.index(self.current_letter)
-        self.current_letter = letters[current_index + 1]
-        # increment firstlast turns:
-        self.current_turn += 1
+        Calculate a score for the episode based on successful turns and target number of turns.
+        Returns:
+            Episode score value in range 0-100.
+        """
+        turn_score_sum = sum(self.turn_scores)
+        success_ratio = turn_score_sum / self.n_turns
+        return success_ratio * 100
 
     def _on_after_game(self) -> None:
         """Log variables needed for scoring."""
